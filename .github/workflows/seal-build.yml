@@ -1,0 +1,120 @@
+# Authored by agentic-sealer: upstream cel-go has no GitHub Actions CI (it builds on
+# Google Cloud Build via cloudbuild.yaml: golang:1.23.0 verify-vendor.sh + bazel test).
+# This workflow builds the Go module zip and runs the root module's go test suite.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional go test -run regex; empty runs the full suite"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.0"
+          cache: false
+      - name: Build x/mod zip helper
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/helper"
+          cd "$RUNNER_TEMP/helper"
+          go mod init sealhelper
+          go get golang.org/x/mod@v0.20.0
+          cat > main.go <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              src, modPath, version, out := os.Args[1], os.Args[2], os.Args[3], os.Args[4]
+              f, err := os.Create(out)
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, module.Version{Path: modPath, Version: version}, src); err != nil {
+                  log.Fatal(err)
+              }
+          }
+          EOF
+          go build -o "$RUNNER_TEMP/modzip" .
+      - name: Create module zip
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/modsrc" dist
+          tar --exclude=./.git --exclude=./dist -cf - . | tar -xf - -C "$RUNNER_TEMP/modsrc"
+          rm -f "$RUNNER_TEMP/modsrc/.github/workflows/seal-build.yml"
+          if [ -d "$RUNNER_TEMP/modsrc/.github/workflows" ] && [ -z "$(ls -A "$RUNNER_TEMP/modsrc/.github/workflows")" ]; then
+            rmdir "$RUNNER_TEMP/modsrc/.github/workflows"
+          fi
+          "$RUNNER_TEMP/modzip" "$RUNNER_TEMP/modsrc" github.com/google/cel-go v0.28.0 dist/v0.28.0.zip
+          unzip -l dist/v0.28.0.zip | tail -n 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: dist/v0.28.0.zip
+          if-no-files-found: error
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.23.0"]
+    env:
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=vendor
+      TEST_FILTER: ${{ inputs.test-filter }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+      - name: Verify vendor directory (upstream cloudbuild step)
+        env:
+          GOFLAGS: ""
+        run: bash scripts/verify-vendor.sh
+      - name: Test
+        run: |
+          set -euo pipefail
+          go version
+          if [ -n "$TEST_FILTER" ]; then
+            go test -v -count=1 -run "$TEST_FILTER" ./... 2>&1 | tee test.log
+          else
+            go test -v -count=1 ./... 2>&1 | tee test.log
+          fi
+      - name: Test summary
+        run: |
+          set -euo pipefail
+          pass=$(awk '/^ *--- PASS/{n++} END{print n+0}' test.log)
+          fail=$(awk '/^ *--- FAIL/{n++} END{print n+0}' test.log)
+          skip=$(awk '/^ *--- SKIP/{n++} END{print n+0}' test.log)
+          echo "Go ${{ matrix.go }}: tests passed=$pass failed=$fail skipped=$skip"
+          echo "Package results:"
+          grep -E '^(ok|FAIL|\?) ' test.log
+          if [ "$skip" -gt 0 ]; then
+            echo "Skipped tests with reasons:"
+            grep -B3 -E '^ *--- SKIP' test.log
+          fi
+          if [ "$fail" -gt 0 ]; then exit 1; fi
